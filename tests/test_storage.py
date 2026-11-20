@@ -2,6 +2,7 @@
 
 Run with:  /tmp/venv/bin/python -m pytest -q
 """
+import errno
 import json
 import os
 import shutil
@@ -11,7 +12,8 @@ import pytest
 
 from app.storage import (
     BLOCK_SIZE, CLONE_NAMES, PHASE_COMPLETED, PHASE_FAILED, PHASE_GC_SWEEP,
-    PHASE_MATERIALIZING, ZERO_HASH, BlockService, StorageError, block_hash,
+    PHASE_MATERIALIZING, ZERO_HASH, BlockService, StorageError, StorageFullError,
+    block_hash,
 )
 
 BLOCK_COUNT = 8
@@ -335,3 +337,179 @@ def test_failure_before_index_removal_keeps_index(tmp_path):
     svc2.start_retirement()
     wait_phase(svc2, PHASE_COMPLETED)
     assert not svc2.template_index_path.exists()
+
+
+# ------------------------------------------------------- durable write semantics
+def test_short_os_write_is_completed_not_committed_half(svc, monkeypatch):
+    """os.write may legally write fewer bytes than requested; a half-written
+    block or index must never be renamed into place nor reported as success."""
+    import app.storage as storage
+
+    real_write = os.write
+
+    def half_write(fd, data):
+        # every call persists only half of what was asked for
+        return real_write(fd, data[: max(1, len(data) // 2)])
+
+    monkeypatch.setattr(storage.os, "write", half_write)
+    payload = fill(b"HALF-BLOCK")
+    svc.overwrite_block("clone-a", 1, payload)
+
+    # full content readable in-process and after a restart with the same volume
+    assert svc.read_block("clone-a", 1).data == payload
+    store_file = svc.store_dir / block_hash(payload)
+    assert store_file.stat().st_size == BLOCK_SIZE
+    svc2 = BlockService(svc.data_dir, BLOCK_COUNT)
+    svc2.initialize()
+    assert svc2.read_block("clone-a", 1).data == payload
+
+
+def test_failed_overwrite_rolls_back_and_never_takes_effect(svc, monkeypatch):
+    """ENOSPC while replacing the index: the block keeps its last committed
+    content, the failed change cannot leak into later persists or a restart,
+    and the failed attempt leaves no temp file or unreferenced block behind."""
+    import app.storage as storage
+
+    svc.overwrite_block("clone-a", 2, fill(b"V1"))
+    files_before = {p.name for p in svc.store_dir.iterdir()}
+
+    real_persist = storage.Clone._persist
+    fail = {"on": True}
+
+    def maybe_fail(self):
+        if fail["on"] and self.name == "clone-a":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_persist(self)
+
+    monkeypatch.setattr(storage.Clone, "_persist", maybe_fail)
+    with pytest.raises(StorageFullError):
+        svc.overwrite_block("clone-a", 2, fill(b"V2-BAD"))
+
+    # in-memory state rolled back to the last committed content
+    assert svc.read_block("clone-a", 2).data == fill(b"V1")
+
+    # a later write to another block of the same clone must not persist the
+    # failed change
+    fail["on"] = False
+    svc.overwrite_block("clone-a", 4, fill(b"OTHER"))
+    assert svc.read_block("clone-a", 2).data == fill(b"V1")
+
+    # restart with the same volume: the failed change never took effect
+    svc2 = BlockService(svc.data_dir, BLOCK_COUNT)
+    svc2.initialize()
+    assert svc2.read_block("clone-a", 2).data == fill(b"V1")
+    assert svc2.read_block("clone-a", 4).data == fill(b"OTHER")
+
+    # failed attempt left no temp files and no unreferenced store block
+    assert list(svc.data_dir.rglob("*.tmp-*")) == []
+    assert svc2.snapshot()["store"]["unreferenced_files"] == []
+    assert not (svc.store_dir / block_hash(fill(b"V2-BAD"))).exists()
+    # blocks still referenced are kept; nothing else was removed
+    assert (svc.store_dir / block_hash(fill(b"V1"))).is_file()
+    assert (svc.store_dir / block_hash(fill(b"OTHER"))).is_file()
+    assert {p.name for p in svc.store_dir.iterdir()} >= files_before
+
+
+def test_failed_discard_rolls_back(svc, monkeypatch):
+    """A discard whose index persist fails keeps the previous block content."""
+    import app.storage as storage
+
+    svc.overwrite_block("clone-b", 5, fill(b"DATA"))
+    real_persist = storage.Clone._persist
+
+    def boom(self):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(storage.Clone, "_persist", boom)
+    with pytest.raises(StorageFullError):
+        svc.discard_block("clone-b", 5)
+
+    assert svc.read_block("clone-b", 5).data == fill(b"DATA")
+    svc2 = BlockService(svc.data_dir, BLOCK_COUNT)
+    svc2.initialize()
+    assert svc2.read_block("clone-b", 5).data == fill(b"DATA")
+    assert list(svc.data_dir.rglob("*.tmp-*")) == []
+
+
+def test_failed_block_write_cleans_temp_and_keeps_old_content(svc, monkeypatch):
+    """ENOSPC in the middle of the block-content write: temp file removed,
+    no store file created, the block keeps its previous (template) content."""
+    import app.storage as storage
+
+    svc.overwrite_block("clone-a", 1, fill(b"OLD"))
+    real_write = os.write
+    state = {"calls": 0}
+
+    def flaky_write(fd, data):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            # first write of the new block: only half goes out...
+            return real_write(fd, data[: len(data) // 2])
+        # ...then the device fills up
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(storage.os, "write", flaky_write)
+    with pytest.raises(StorageFullError):
+        svc.overwrite_block("clone-a", 1, fill(b"NEW"))
+
+    # no temp file, no half-written store file, no metadata change
+    assert list(svc.data_dir.rglob("*.tmp-*")) == []
+    assert not (svc.store_dir / block_hash(fill(b"NEW"))).exists()
+    assert svc.read_block("clone-a", 1).data == fill(b"OLD")
+    svc2 = BlockService(svc.data_dir, BLOCK_COUNT)
+    svc2.initialize()
+    assert svc2.read_block("clone-a", 1).data == fill(b"OLD")
+
+
+def test_failed_overwrite_keeps_shared_referenced_block(svc, monkeypatch):
+    """Rollback must not delete a store block still referenced elsewhere."""
+    import app.storage as storage
+
+    payload = fill(b"SHARED")
+    svc.overwrite_block("clone-a", 0, payload)  # committed, referenced by clone-a
+
+    real_persist = storage.Clone._persist
+
+    def boom(self):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(storage.Clone, "_persist", boom)
+    # clone-b tries to write the same content; persist fails -> rollback, but
+    # the shared physical block is still referenced by clone-a and must stay.
+    with pytest.raises(StorageFullError):
+        svc.overwrite_block("clone-b", 0, payload)
+
+    assert (svc.store_dir / block_hash(payload)).is_file()
+    assert svc.read_block("clone-a", 0).data == payload
+    assert svc.read_block("clone-b", 0).source == "template"
+
+
+def test_truncated_store_block_is_repaired_on_rewrite(svc):
+    """A truncated store file left by the old bug is not trusted: writing the
+    same content again rewrites it in full."""
+    payload = fill(b"REPAIR")
+    svc.overwrite_block("clone-a", 3, payload)
+    store_file = svc.store_dir / block_hash(payload)
+    # simulate the old half-block bug
+    store_file.write_bytes(payload[: BLOCK_SIZE // 2])
+    svc.overwrite_block("clone-a", 3, payload)
+    assert store_file.stat().st_size == BLOCK_SIZE
+    assert svc.read_block("clone-a", 3).data == payload
+
+
+def test_startup_sweeps_stale_temp_files(tmp_path):
+    data_dir = tmp_path / "data"
+    svc = BlockService(data_dir, BLOCK_COUNT)
+    svc.initialize()
+    svc.stop_worker()
+    # plant leftovers of interrupted writes
+    (svc.store_dir / "deadbeef.tmp-1-2").write_bytes(b"x")
+    (svc.clones_dir / "clone-a.json.tmp-1-2").write_bytes(b"x")
+    (svc.template_dir / "index.json.tmp-1-2").write_bytes(b"x")
+
+    svc2 = BlockService(data_dir, BLOCK_COUNT)
+    svc2.initialize()
+    assert list(data_dir.rglob("*.tmp-*")) == []
+    # volume still fully usable
+    svc2.overwrite_block("clone-a", 0, fill(b"OK"))
+    assert svc2.read_block("clone-a", 0).data == fill(b"OK")

@@ -7,13 +7,22 @@ On-disk layout (``DATA_DIR``, mounted as a Docker volume)::
     clones/<name>.json         # clone metadata (overwrites + discards)
     retirement.json            # durable retirement state machine
 
-Every mutation is persisted with a temp-file + fsync + atomic rename before the
-API call returns, so a process crash can never lose a confirmed overwrite or
+Every mutation is persisted with a temp file + full write (looping over short
+``os.write`` results) + fsync + atomic rename + directory fsync before the API
+call returns, so a process crash can never lose a confirmed overwrite or
 discard, and an interrupted retirement simply resumes on the next startup.
+
+A failed write never leaks into the committed state: the in-memory change is
+rolled back, the temp file is removed, and a store block created by the failed
+attempt is reclaimed once nothing references it. The last committed content of
+the block therefore survives later writes to the same clone and restarts with
+the same volume. A full volume (ENOSPC/EDQUOT) raises :class:`StorageFullError`,
+which the API maps to HTTP 507.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -21,7 +30,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 BLOCK_SIZE = 4096
 ZEROS = b"\x00" * BLOCK_SIZE
@@ -42,18 +51,60 @@ RET_FILENAME = "retirement.json"
 INDEX_FILENAME = "index.json"
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write bytes durably: temp file + fsync + atomic rename + dir fsync."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp-" + str(os.getpid()) + "-" + str(time.time_ns()))
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data``, looping over short writes.
+
+    ``os.write`` is allowed to write fewer bytes than requested (e.g. when
+    interrupted or when the device fills up mid-write); a single call can
+    therefore silently persist only half a block. Loop until the buffer is
+    exhausted and fail loudly if no progress is made.
+    """
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError(errno.EIO, f"os.write returned {n} bytes (no progress)")
+        view = view[n:]
+
+
+def _remove_quietly(path: Path) -> None:
+    """Best-effort unlink used for temp-file cleanup; never raises."""
     try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
-    _fsync_dir(path.parent)
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write bytes durably: temp file + full write + fsync + atomic rename +
+    dir fsync.
+
+    Success is reported only after *every* byte is on stable storage under
+    the final name. Any failure removes the temp file and raises, so the
+    previously committed version of ``path`` (if any) stays intact and a
+    half-written file is never renamed into place.
+    """
+    tmp: Optional[Path] = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp-" + str(os.getpid()) + "-" + str(time.time_ns()))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            _write_all(fd, data)
+            if os.fstat(fd).st_size != len(data):
+                raise OSError(
+                    errno.EIO,
+                    f"short write: {tmp} holds {os.fstat(fd).st_size} of {len(data)} bytes",
+                )
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    except OSError as exc:
+        if tmp is not None:
+            _remove_quietly(tmp)
+        _raise_translated(exc)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -86,6 +137,37 @@ class BlockRead:
 
 class StorageError(Exception):
     pass
+
+
+class StorageFullError(StorageError):
+    """The volume is out of space (ENOSPC/EDQUOT); the API maps this to 507."""
+
+
+def _translate_os_error(exc: Exception) -> Exception:
+    """Map ENOSPC/EDQUOT to :class:`StorageFullError`; pass others through."""
+    if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return StorageFullError(f"volume full, write not persisted: {exc}")
+    return exc
+
+
+def _raise_translated(exc: Exception) -> NoReturn:
+    """Re-raise ``exc``, converting a full-volume OSError to StorageFullError."""
+    translated = _translate_os_error(exc)
+    if translated is exc:
+        raise exc
+    raise translated from exc
+
+
+def _store_block_intact(path: Path) -> bool:
+    """A committed block file holds exactly BLOCK_SIZE bytes.
+
+    Anything else (e.g. a truncated leftover from an interrupted write by an
+    older version) is treated as absent and rewritten with the full content.
+    """
+    try:
+        return path.is_file() and path.stat().st_size == BLOCK_SIZE
+    except OSError:
+        return False
 
 
 class Clone:
@@ -159,6 +241,7 @@ class BlockService:
         self.store_dir.mkdir(exist_ok=True)
         self.template_dir.mkdir(exist_ok=True)
         self.clones_dir.mkdir(exist_ok=True)
+        self._sweep_stale_temp_files()
 
         if self.template_index_path.exists():
             doc = json.loads(self.template_index_path.read_text("utf-8"))
@@ -185,6 +268,26 @@ class BlockService:
         else:
             self.retirement = {"state": "idle"}
 
+    def _sweep_stale_temp_files(self) -> None:
+        """Remove ``*.tmp-*`` leftovers from interrupted or failed writes.
+
+        Runs only at startup, while this process is the single writer, so no
+        in-flight temp file of a live operation can be removed.
+        """
+        for directory in (self.data_dir, self.store_dir, self.template_dir,
+                          self.clones_dir):
+            try:
+                entries = list(directory.iterdir())
+            except OSError:
+                continue
+            removed = False
+            for p in entries:
+                if p.is_file() and ".tmp-" in p.name:
+                    _remove_quietly(p)
+                    removed = True
+            if removed:
+                _fsync_dir(directory)
+
     def _seed_template(self) -> None:
         """Create the read-only template: N deterministic 4 KiB blocks."""
         index: dict[int, str] = {}
@@ -193,7 +296,7 @@ class BlockService:
             h = block_hash(data)
             index[no] = h
             store_path = self.store_dir / h
-            if not store_path.exists():
+            if not _store_block_intact(store_path):
                 _atomic_write_bytes(store_path, data)
         _atomic_write_json(self.template_index_path, {
             "version": 1,
@@ -213,7 +316,7 @@ class BlockService:
     def _store_put(self, data: bytes) -> str:
         h = block_hash(data)
         path = self.store_dir / h
-        if not path.exists():
+        if not _store_block_intact(path):
             _atomic_write_bytes(path, data)
         return h
 
@@ -271,6 +374,17 @@ class BlockService:
             return True
         return False
 
+    def _best_effort_release(self, h: str) -> None:
+        """Reclaim an orphaned store file without ever failing the caller.
+
+        Cleanup must not change the outcome of an operation whose metadata is
+        already settled; a leftover file is reclaimed by the next GC sweep.
+        """
+        try:
+            self._release_if_orphaned(h)
+        except OSError:
+            pass
+
     def overwrite_block(self, clone_name: str, block_no: int, data: bytes) -> dict[str, Any]:
         if len(data) != BLOCK_SIZE:
             raise StorageError(f"block data must be exactly {BLOCK_SIZE} bytes, got {len(data)}")
@@ -279,13 +393,34 @@ class BlockService:
         with self.global_lock:
             with clone.lock:
                 old = clone.blocks.get(block_no)
-                h = self._store_put(data)
+                # 1. Persist the block content first; only a fully written and
+                #    fsynced store file may ever be referenced by the index.
+                try:
+                    h = self._store_put(data)
+                except Exception as exc:
+                    _raise_translated(exc)
+                # 2. Persist the clone index. If this fails, the on-disk index
+                #    still holds the last committed entry, so roll the
+                #    in-memory change back: the failed write must not become
+                #    visible now, leak into a later persist of another block
+                #    of this clone, or survive a restart with the same volume.
                 clone.blocks[block_no] = {"kind": "data", "hash": h}
-                clone._persist()
-                # Reclaim the replaced physical block immediately if nothing
-                # else references it, so the volume stays GC-clean at rest.
+                try:
+                    clone._persist()
+                except Exception as exc:
+                    if old is None:
+                        clone.blocks.pop(block_no, None)
+                    else:
+                        clone.blocks[block_no] = old
+                    # Reclaim the block this attempt may have just created,
+                    # but only once nothing references it anymore; blocks
+                    # still referenced by the template/clones are kept.
+                    self._best_effort_release(h)
+                    _raise_translated(exc)
+                # Committed: reclaim the replaced physical block immediately
+                # if nothing else references it (best effort; GC is backstop).
                 if old is not None and old["kind"] == "data" and old["hash"] != h:
-                    self._release_if_orphaned(old["hash"])
+                    self._best_effort_release(old["hash"])
         return {"block_no": block_no, "hash": h, "kind": "data"}
 
     def discard_block(self, clone_name: str, block_no: int) -> dict[str, Any]:
@@ -295,9 +430,19 @@ class BlockService:
             with clone.lock:
                 old = clone.blocks.get(block_no)
                 clone.blocks[block_no] = {"kind": "zero", "hash": ZERO_HASH}
-                clone._persist()
+                try:
+                    clone._persist()
+                except Exception as exc:
+                    # Index not persisted: restore the last committed entry so
+                    # the failed discard cannot take effect in this process,
+                    # in a later persist, or after a restart.
+                    if old is None:
+                        clone.blocks.pop(block_no, None)
+                    else:
+                        clone.blocks[block_no] = old
+                    _raise_translated(exc)
                 if old is not None and old["kind"] == "data":
-                    self._release_if_orphaned(old["hash"])
+                    self._best_effort_release(old["hash"])
         return {"block_no": block_no, "hash": ZERO_HASH, "kind": "zero"}
 
     def _get_clone(self, name: str) -> Clone:

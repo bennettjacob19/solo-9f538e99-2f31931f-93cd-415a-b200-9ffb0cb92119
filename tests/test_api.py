@@ -101,3 +101,81 @@ def test_index_page_served(client):
     r = c.get("/")
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
+
+
+def test_put_returns_507_and_keeps_old_content_when_volume_full(client, monkeypatch):
+    c, _ = client
+    import errno
+
+    import app.storage as storage
+
+    # commit a first version
+    assert c.put("/api/clones/clone-a/blocks/2", json={"pattern": "ones"}).status_code == 200
+
+    real_persist = storage.Clone._persist
+
+    def boom(self):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(storage.Clone, "_persist", boom)
+    r = c.put("/api/clones/clone-a/blocks/2", json={"pattern": "zero"})
+    assert r.status_code == 507
+    assert r.json()["error"]
+
+    # the failed write did not take effect: last committed content is served
+    got = c.get("/api/clones/clone-a/blocks/2").json()
+    assert got["source"] == "clone"
+    assert got["data_hex"] == "ff" * 4096
+
+
+def test_delete_returns_507_and_keeps_block_when_volume_full(client, monkeypatch):
+    c, _ = client
+    import errno
+
+    import app.storage as storage
+
+    real_persist = storage.Clone._persist
+
+    def boom(self):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(storage.Clone, "_persist", boom)
+    r = c.delete("/api/clones/clone-a/blocks/0")
+    assert r.status_code == 507
+    assert r.json()["error"]
+    # block unchanged: still resolved through the template, not discarded
+    assert c.get("/api/clones/clone-a/blocks/0").json()["source"] == "template"
+
+
+def test_failed_write_leaves_volume_clean(client, monkeypatch):
+    """After a failed PUT the volume has no temp files and no unreferenced
+    blocks, and a later successful write does not resurrect the failed one."""
+    c, main = client
+    import errno
+
+    import app.storage as storage
+
+    real_persist = storage.Clone._persist
+    fail = {"on": True}
+
+    def maybe_fail(self):
+        if fail["on"]:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_persist(self)
+
+    monkeypatch.setattr(storage.Clone, "_persist", maybe_fail)
+    bad_hex = "ab" * 4096
+    assert c.put("/api/clones/clone-a/blocks/1",
+                 json={"data_hex": bad_hex}).status_code == 507
+
+    fail["on"] = False
+    assert c.put("/api/clones/clone-a/blocks/3", json={"pattern": "ones"}).status_code == 200
+
+    # failed content never became visible, successful write is visible
+    assert c.get("/api/clones/clone-a/blocks/1").json()["source"] == "template"
+    assert c.get("/api/clones/clone-a/blocks/3").json()["data_hex"] == "ff" * 4096
+
+    snap = c.get("/api/status").json()
+    assert snap["store"]["unreferenced_files"] == []
+    data_dir = main.service.data_dir
+    assert list(data_dir.rglob("*.tmp-*")) == []

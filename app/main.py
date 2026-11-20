@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,7 +13,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .storage import BLOCK_SIZE, CLONE_NAMES, BlockService, StorageError
+from .storage import BLOCK_SIZE, CLONE_NAMES, BlockService, StorageError, StorageFullError
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 BLOCK_COUNT = int(os.environ.get("BLOCK_COUNT", "32"))
@@ -37,9 +38,24 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Local Block Storage Drill", version="1.0.0", lifespan=lifespan)
 
 
+@app.exception_handler(StorageFullError)
+async def storage_full_handler(request: Request, exc: StorageFullError) -> JSONResponse:
+    # 507 Insufficient Storage: the write could not be persisted because the
+    # volume is full. The block keeps its last committed content.
+    return JSONResponse(status_code=507, content={"error": str(exc)})
+
+
 @app.exception_handler(StorageError)
 async def storage_error_handler(request: Request, exc: StorageError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.exception_handler(OSError)
+async def os_error_handler(request: Request, exc: OSError) -> JSONResponse:
+    # Backstop: any ENOSPC/EDQUOT escaping the storage layer still maps to 507.
+    if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return JSONResponse(status_code=507, content={"error": f"volume full: {exc}"})
+    return JSONResponse(status_code=500, content={"error": f"I/O error: {exc}"})
 
 
 def svc() -> BlockService:

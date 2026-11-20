@@ -121,7 +121,7 @@
     <div class="row" style="margin-top:12px">
       <button id="btn-write">覆盖写入</button>
       <button id="btn-discard" class="danger">丢弃（读零）</button>
-      <span class="muted" style="align-self:center">改动只影响所选克隆盘，元数据落盘后才返回成功</span>
+      <span class="muted" style="align-self:center">改动只影响所选克隆盘；块内容与克隆索引完整落盘后才报成功，失败则保留上次提交的内容（空间不足返回 507）</span>
     </div>
     <div id="op-flash" class="flash"></div>
   </section>
@@ -310,9 +310,14 @@ async function doWrite() {
   try {
     const r = await api(`/api/clones/${name}/blocks/${no}`, {
       method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
-    flash($("op-flash"), `覆盖成功：${name} 块 ${r.block_no} → ${r.hash.slice(0,16)}…`, true);
-    await refresh(); doRead();
-  } catch (e) { flash($("op-flash"), "覆盖失败：" + e.message, false); }
+    flash($("op-flash"), `覆盖成功：${name} 块 ${r.block_no} → ${r.hash.slice(0,16)}…（块内容与克隆索引已完整落盘）`, true);
+  } catch (e) {
+    // 失败：该块保持上次提交的内容；输入不清空，修正后可直接重试
+    flash($("op-flash"), `覆盖失败：${e.message}。该块仍是上次提交的内容（已自动重读），输入已保留，可重试。`, false);
+  }
+  // 无论成败都刷新卷状态并重读本次操作的块，展示落盘后的真实内容
+  await refresh();
+  await doRead();
 }
 
 async function doDiscard() {
@@ -320,9 +325,12 @@ async function doDiscard() {
   if (!confirm(`确认丢弃 ${name} 的块 ${no}？丢弃后读取返回全零。`)) return;
   try {
     await api(`/api/clones/${name}/blocks/${no}`, {method: "DELETE"});
-    flash($("op-flash"), `已丢弃：${name} 块 ${no} 现在读零`, true);
-    await refresh(); doRead();
-  } catch (e) { flash($("op-flash"), "丢弃失败：" + e.message, false); }
+    flash($("op-flash"), `已丢弃：${name} 块 ${no} 现在读零（克隆索引已完整落盘）`, true);
+  } catch (e) {
+    flash($("op-flash"), `丢弃失败：${e.message}。该块仍是上次提交的内容（已自动重读），可重试。`, false);
+  }
+  await refresh();
+  await doRead();
 }
 
 $("btn-read").onclick = doRead;
